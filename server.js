@@ -4,7 +4,7 @@ const schedule = require("node-schedule");
 const moment = require("moment-timezone");
 
 const token = process.env.TELEGRAM_TOKEN;
-const bot = new TelegramBot(token, { polling: true, request: { debug: true } });
+const bot = new TelegramBot(token, { polling: true });
 const userState = {}; // Stores user state
 
 const db = new sqlite3.Database("./tasks.db");
@@ -52,63 +52,67 @@ function sendTimeOptions(chatId) {
       ],
     },
   });
+  userState[chatId].step = "waitingForTime";
 }
 
-// Function to schedule reminder (adjusted for timezone)
-function scheduleReminder(chatId, reminderTime, task, timezone) {
-  console.log(`Original reminderTime: ${reminderTime}`);
-  console.log(`User timezone: ${timezone}`);
+// Send reminder options to user
+function sendReminderOptions(chatId) {
+  bot.sendMessage(chatId, "When would you like to receive a reminder?", {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "1 hour before", callback_data: "one_hour" }],
+        [{ text: "1 day before", callback_data: "one_day" }],
+        [{ text: "Custom time", callback_data: "custom_reminder" }],
+      ],
+    },
+  });
+  userState[chatId].step = "waitingForReminder";
+}
 
+// Send date options to user
+function sendDateOptions(chatId) {
+  bot.sendMessage(chatId, "When is this task scheduled?", {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "Today", callback_data: "today" }],
+        [{ text: "Tomorrow", callback_data: "tomorrow" }],
+        [{ text: "Enter custom date", callback_data: "custom_date" }]
+      ]
+    }
+  });
+  userState[chatId].step = "waitingForDate";
+}
+
+// Schedule reminder with user's timezone
+function scheduleReminder(chatId, reminderTime, task, timezone) {
   const reminderTimeInUserTz = moment.tz(reminderTime, timezone);
-  console.log(`Reminder time in user timezone: ${reminderTimeInUserTz.format()}`);
-  
   const reminderTimeUtc = reminderTimeInUserTz.utc().toDate();
-  console.log(`Reminder time in UTC: ${reminderTimeUtc}`);
-  
+
   const currentTime = new Date();
-  console.log(`Current time: ${currentTime}`);
-  
   if (reminderTimeUtc <= currentTime) {
-    console.log(`Reminder time ${reminderTimeUtc} is in the past. Skipping scheduling.`);
-    return;
+    return; // Skip scheduling if reminder time is in the past
   }
-  
+
   schedule.scheduleJob(reminderTimeUtc, () => {
-    console.log(`Sending reminder for ${task} at ${new Date()}`);
     bot.sendMessage(chatId, `Reminder: ${task}`);
   });
 }
 
-
-
-
-
-// Save task to database (adjusted for timezone)
-function saveTask(chatId, chosenDateTime, reminderTime) {
-  if (!(chosenDateTime instanceof Date) || isNaN(chosenDateTime)) {
-    console.error("Invalid chosenDateTime:", chosenDateTime);
-    return;
-  }
-  if (!(reminderTime instanceof Date) || isNaN(reminderTime)) {
-    console.error("Invalid reminderTime:", reminderTime);
-    return;
-  }
-
+// Save task to database (with timezone consideration)
+function saveTask(chatId, task, dateTime, reminderTime) {
   const timezone = userState[chatId]?.timezone;
-  console.log(`Timezone for user ${chatId}: ${timezone}`);
 
   if (!timezone) {
-    console.error("Timezone is undefined. Cannot save task.");
+    console.error(`No timezone set for user ${chatId}`);
     return;
   }
 
-  // Convert times to UTC before saving
-  const chosenDateTimeUtc = moment.tz(chosenDateTime, timezone).utc().toISOString();
-  const reminderTimeUtc = moment.tz(reminderTime, timezone).utc().toISOString();
+  const dateTimeUtc = moment.tz(dateTime, timezone).utc().toISOString();
+  const reminderTimeUtc = reminderTime ? moment.tz(reminderTime, timezone).utc().toISOString() : null;
 
   db.run(
     "INSERT INTO tasks (chat_id, task, date_time, reminder_time, timezone) VALUES (?, ?, ?, ?, ?)",
-    [chatId, userState[chatId].task, chosenDateTimeUtc, reminderTimeUtc, timezone],
+    [chatId, task, dateTimeUtc, reminderTimeUtc, timezone],
     (err) => {
       if (err) {
         console.error(`Error saving task: ${err.message}`);
@@ -118,9 +122,6 @@ function saveTask(chatId, chosenDateTime, reminderTime) {
     }
   );
 }
-
-
-
 
 // Load scheduled reminders from database
 function loadScheduledReminders() {
@@ -133,26 +134,12 @@ function loadScheduledReminders() {
     rows.forEach((row) => {
       const reminderTime = new Date(row.reminder_time);
       const timezone = row.timezone;
-      
-      console.log(`Loaded reminder time: ${reminderTime}`);
-      console.log(`Loaded timezone: ${timezone}`);
-      
+
       if (reminderTime > new Date()) {
         scheduleReminder(row.chat_id, reminderTime, row.task, timezone);
       }
     });
   });
-}
-
-
-
-
-// Clear user state
-function clearUserState(chatId) {
-  if (userState[chatId]) {
-    delete userState[chatId];
-    console.log(`State for user ${chatId} cleared.`);
-  }
 }
 
 // Handle reminder settings
@@ -170,221 +157,161 @@ function handleReminder(chatId, data) {
   }
 
   scheduleReminder(chatId, reminderTime, userState[chatId].task, userState[chatId].timezone);
-  saveTask(chatId, userState[chatId].chosenDateTime, reminderTime);
+  saveTask(chatId, userState[chatId].task, userState[chatId].chosenDateTime, reminderTime);
   bot.sendMessage(chatId, "Task added! You will receive a reminder at the specified time.");
   clearUserState(chatId);
 }
 
-// Send reminder options to user
-function sendReminderOptions(chatId) {
-  bot.sendMessage(chatId, "When would you like to receive a reminder?", {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: "1 hour before", callback_data: "one_hour" }],
-        [{ text: "1 day before", callback_data: "one_day" }],
-        [{ text: "Custom time", callback_data: "custom_reminder" }],
-      ],
-    },
-  });
-  userState[chatId].step = "waitingForReminder";
+// Handle date selection
+function handleDateSelection(chatId, data) {
+  let chosenDate;
+
+  if (data === "today") {
+    chosenDate = moment.tz(userState[chatId].timezone).format("YYYY-MM-DD");
+  } else if (data === "tomorrow") {
+    chosenDate = moment.tz(userState[chatId].timezone).add(1, 'days').format("YYYY-MM-DD");
+  } else if (data === "custom_date") {
+    bot.sendMessage(chatId, "Please enter the custom date in YYYY-MM-DD format.");
+    userState[chatId].step = "waitingForCustomDate";
+    return;
+  }
+
+  userState[chatId].chosenDate = chosenDate;
+  sendTimeOptions(chatId);
 }
+
+// Handle time selection
+function handleTimeSelection(chatId, data) {
+  let chosenTime;
+
+  if (data === "custom_time") {
+    bot.sendMessage(chatId, "Please enter the custom time for your task in HH:MM format.");
+    userState[chatId].step = "waitingForCustomTime";
+    return;
+  } else {
+    chosenTime = data;
+  }
+
+  const chosenDateTime = `${userState[chatId].chosenDate} ${chosenTime}`;
+  userState[chatId].chosenDateTime = moment.tz(chosenDateTime, "YYYY-MM-DD HH:mm", userState[chatId].timezone).toDate();
+
+  sendReminderOptions(chatId);
+}
+
+// Clear user state
+function clearUserState(chatId) {
+  if (userState[chatId]) {
+    delete userState[chatId];
+  }
+}
+
 // Handle the /start command
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
-  
+
   db.get("SELECT timezone FROM tasks WHERE chat_id = ?", [chatId], (err, row) => {
     if (err) {
-      console.error(`Error fetching timezone: ${err.message}`);
       bot.sendMessage(chatId, "An error occurred. Please try again later.");
       return;
     }
-    
+
     if (!row || !row.timezone) {
       userState[chatId] = { step: "waitingForTimezone" };
       bot.sendMessage(chatId, "Welcome! Please provide your timezone in the format 'Continent/City' (e.g., Europe/Kiev).");
     } else {
-      console.log(`Timezone for user ${chatId} is ${row.timezone}`);
-      userState[chatId] = { timezone: row.timezone }; // Ensure timezone is set in userState
+      userState[chatId] = { timezone: row.timezone };
       bot.sendMessage(chatId, `Welcome back! Your timezone is set to ${row.timezone}.`);
     }
   });
 });
 
-
-
 // Handle the /set_timezone command
 bot.onText(/\/set_timezone/, (msg) => {
   const chatId = msg.chat.id;
   userState[chatId] = { step: "waitingForTimezone" };
-  bot.sendMessage(
-    chatId,
-    "Please provide your timezone in the format 'Continent/City' (e.g., Europe/Kiev).\n\nHere are a few common timezones you can use:\n- Europe/Kiev\n- Europe/London\n- America/New_York\n- Asia/Tokyo"
-  );
+  bot.sendMessage(chatId, "Please provide your timezone in the format 'Continent/City' (e.g., Europe/Kiev).");
 });
 
+// Handle user messages for setting timezone or task details
 bot.on("message", (msg) => {
   const chatId = msg.chat.id;
 
   if (userState[chatId] && userState[chatId].step === "waitingForTimezone") {
-    const timezone = msg.text;
+    const timezone = msg.text.trim();
+if (moment.tz.zone(timezone)) {
+  // Таймзона вірна
+  db.run("UPDATE tasks SET timezone = ? WHERE chat_id = ?", [timezone, chatId], (err) => {
+    if (err) {
+      bot.sendMessage(chatId, "An error occurred while saving your timezone.");
+      return;
+    }
 
-    if (moment.tz.names().includes(timezone)) {
-      console.log(`Valid timezone received: ${timezone}`);
-      db.run("UPDATE tasks SET timezone = ? WHERE chat_id = ?", [timezone, chatId], (err) => {
-        if (err) {
-          console.error(`Error updating timezone: ${err.message}`);
-          bot.sendMessage(chatId, "An error occurred while saving your timezone.");
-          return;
-        }
-        // Ensure timezone is also set in userState
-        userState[chatId].timezone = timezone;
-        bot.sendMessage(chatId, `✅ Timezone set to ${timezone}.`);
-        clearUserState(chatId);
-      });
+    userState[chatId].timezone = timezone;
+    bot.sendMessage(chatId, `Timezone set to ${timezone}. You can now add tasks.`);
+  });
+} else {
+  // Неправильний формат таймзони
+  bot.sendMessage(chatId, "Invalid timezone format. Please try again.");
+  console.log(`Invalid timezone: ${timezone}`);
+}
+
+  } else if (userState[chatId] && userState[chatId].step === "waitingForTaskDescription") {
+    userState[chatId].task = msg.text.trim();
+    sendDateOptions(chatId);
+  } else if (userState[chatId] && userState[chatId].step === "waitingForCustomDate") {
+    const date = msg.text.trim();
+    if (moment(date, "YYYY-MM-DD", true).isValid()) {
+      userState[chatId].chosenDate = date;
+      sendTimeOptions(chatId);
     } else {
-      bot.sendMessage(chatId, `❌ Invalid timezone: "${timezone}". Please enter a valid timezone in the format 'Continent/City'.`);
+      bot.sendMessage(chatId, "Invalid date format. Please enter the date in YYYY-MM-DD format.");
+    }
+  } else if (userState[chatId] && userState[chatId].step === "waitingForCustomTime") {
+    const time = msg.text.trim();
+    if (moment(time, "HH:mm", true).isValid()) {
+      const chosenDateTime = `${userState[chatId].chosenDate} ${time}`;
+      userState[chatId].chosenDateTime = moment.tz(chosenDateTime, "YYYY-MM-DD HH:mm", userState[chatId].timezone).toDate();
+      sendReminderOptions(chatId);
+    } else {
+      bot.sendMessage(chatId, "Invalid time format. Please enter the time in HH:MM format.");
+    }
+  } else if (userState[chatId] && userState[chatId].step === "waitingForCustomReminder") {
+    const minutes = parseInt(msg.text.trim(), 10);
+    if (!isNaN(minutes) && minutes > 0) {
+      const reminderTime = new Date(userState[chatId].chosenDateTime.getTime() - minutes * 60 * 1000);
+      scheduleReminder(chatId, reminderTime, userState[chatId].task, userState[chatId].timezone);
+      saveTask(chatId, userState[chatId].task, userState[chatId].chosenDateTime, reminderTime);
+      bot.sendMessage(chatId, `Task added! You will receive a reminder ${minutes} minutes before the task.`);
+      clearUserState(chatId);
+    } else {
+      bot.sendMessage(chatId, "Please enter a valid number of minutes.");
     }
   }
 });
 
-
-// Add task command
+// Handle the /add command (now without task description)
 bot.onText(/\/add/, (msg) => {
   const chatId = msg.chat.id;
 
-  if (userState[chatId] && userState[chatId].step) {
-    bot.sendMessage(chatId, "Please complete the previous action first.");
+  if (!userState[chatId] || !userState[chatId].timezone) {
+    bot.sendMessage(chatId, "Please set your timezone using /set_timezone before adding tasks.");
     return;
   }
 
-  userState[chatId] = { step: "waitingForTaskName" };
-  bot.sendMessage(chatId, "Enter the task name (or /cancel to cancel):");
+  userState[chatId] = { step: "waitingForTaskDescription", timezone: userState[chatId].timezone };
+  bot.sendMessage(chatId, "Please enter the description of the task.");
 });
 
-// Handle incoming messages for task name
-bot.on("message", (msg) => {
-  const chatId = msg.chat.id;
+// Handle callback queries (date, time, reminder selection)
+bot.on("callback_query", (callbackQuery) => {
+  const chatId = callbackQuery.message.chat.id;
+  const data = callbackQuery.data;
 
-  // Step: waiting for task name
-  if (userState[chatId] && userState[chatId].step === "waitingForTaskName") {
-    const taskName = msg.text;
-
-    if (taskName === "/cancel") {
-      clearUserState(chatId);
-      bot.sendMessage(chatId, "Action canceled.");
-      return;
-    }
-
-    userState[chatId].task = taskName;
-    userState[chatId].step = "waitingForTaskDate";
-    bot.sendMessage(chatId, "Enter the task date in the format YYYY-MM-DD (or /cancel to cancel):");
-    return;
-  }
-
-  // Step: waiting for task date
-  if (userState[chatId] && userState[chatId].step === "waitingForTaskDate") {
-    const taskDate = msg.text;
-
-    if (taskDate === "/cancel") {
-      clearUserState(chatId);
-      bot.sendMessage(chatId, "Action canceled.");
-      return;
-    }
-
-    if (!moment(taskDate, "YYYY-MM-DD", true).isValid()) {
-      bot.sendMessage(chatId, "Invalid date format. Please enter the date in the format YYYY-MM-DD.");
-      return;
-    }
-
-    userState[chatId].taskDate = taskDate;
-    userState[chatId].step = "waitingForTaskTime";
-    bot.sendMessage(chatId, "Enter the task time in the format HH:mm (or /cancel to cancel):");
-    return;
-  }
-
-  // Step: waiting for task time
-  if (userState[chatId] && userState[chatId].step === "waitingForTaskTime") {
-    const taskTime = msg.text;
-
-    if (taskTime === "/cancel") {
-      clearUserState(chatId);
-      bot.sendMessage(chatId, "Action canceled.");
-      return;
-    }
-
-    if (!moment(taskTime, "HH:mm", true).isValid()) {
-      bot.sendMessage(chatId, "Invalid time format. Please enter the time in the format HH:mm.");
-      return;
-    }
-
-    userState[chatId].taskTime = taskTime;
-    const dateTimeString = `${userState[chatId].taskDate} ${userState[chatId].taskTime}`;
-    const chosenDateTime = moment.tz(dateTimeString, userState[chatId].timezone);
-
-    if (!chosenDateTime.isValid()) {
-      bot.sendMessage(chatId, "Invalid date or time. Please try again.");
-      return;
-    }
-
-    userState[chatId].chosenDateTime = chosenDateTime.toDate();
-    sendReminderOptions(chatId);
-  }
-
-  // Handle custom reminder time input
-  if (userState[chatId] && userState[chatId].step === "waitingForCustomReminder") {
-    const customMinutes = parseInt(msg.text, 10);
-    if (isNaN(customMinutes)) {
-      bot.sendMessage(chatId, "Invalid input. Please enter a number.");
-      return;
-    }
-
-    const reminderTime = new Date(userState[chatId].chosenDateTime.getTime() - customMinutes * 60 * 1000);
-    scheduleReminder(chatId, reminderTime, userState[chatId].task, userState[chatId].timezone);
-    saveTask(chatId, userState[chatId].chosenDateTime, reminderTime);
-    bot.sendMessage(chatId, "Task added! You will receive a reminder at the specified time.");
-    clearUserState(chatId);
-  }
-});
-
-// View tasks command
-bot.onText(/\/tasks/, (msg) => {
-  const chatId = msg.chat.id;
-
-  db.all("SELECT id, task, date_time, timezone FROM tasks WHERE chat_id = ?", [chatId], (err, rows) => {
-    if (err) {
-      bot.sendMessage(chatId, "Error fetching tasks.");
-      return;
-    }
-
-    if (rows.length === 0) {
-      bot.sendMessage(chatId, "You have no tasks.");
-    } else {
-      let taskList = "Your tasks:\n";
-      rows.forEach((row) => {
-        const dateTimeInUserTz = moment.tz(row.date_time, row.timezone).format('YYYY-MM-DD HH:mm');
-        taskList += `ID: ${row.id}\nTask: ${row.task}\nDate and Time: ${dateTimeInUserTz} (${row.timezone})\n\n`;
-      });
-      bot.sendMessage(chatId, taskList);
-    }
-  });
-});
-
-// Cancel action command
-bot.onText(/\/cancel/, (msg) => {
-  const chatId = msg.chat.id;
-  if (userState[chatId]) {
-    clearUserState(chatId);
-    bot.sendMessage(chatId, "Action canceled.");
-  } else {
-    bot.sendMessage(chatId, "No active action to cancel.");
-  }
-});
-// Handle callback queries for reminder options
-bot.on("callback_query", (query) => {
-  const chatId = query.message.chat.id;
-  const data = query.data;
-
-  if (userState[chatId] && userState[chatId].step === "waitingForReminder") {
+  if (userState[chatId].step === "waitingForDate") {
+    handleDateSelection(chatId, data);
+  } else if (userState[chatId].step === "waitingForTime") {
+    handleTimeSelection(chatId, data);
+  } else if (userState[chatId].step === "waitingForReminder") {
     handleReminder(chatId, data);
   }
 });
