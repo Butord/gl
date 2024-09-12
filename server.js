@@ -11,7 +11,8 @@ const db = new sqlite3.Database("./tasks.db");
 bot.on("polling_error", (error) => {
   console.error(`Polling error: ${error.code} - ${error.message}`);
 });
-
+// Завантаження запланованих нагадувань при запуску бота
+loadScheduledReminders();
 // Створення таблиці, якщо вона не існує
 db.serialize(() => {
   db.run(
@@ -50,12 +51,13 @@ function sendTimeOptions(chatId) {
 }
 
 function scheduleReminder(chatId, reminderTime, task) {
-  console.log(`Scheduling reminder for ${reminderTime}`); // Додайте лог для перевірки
+  console.log(`Scheduling reminder for ${reminderTime}`);
   schedule.scheduleJob(reminderTime, () => {
     bot.sendMessage(chatId, `Reminder: ${task}`);
-    console.log(`Reminder sent for task: ${task}`); // Додайте лог для перевірки
+    console.log(`Reminder sent for task: ${task}`);
   });
 }
+
 
 // Ваша функція обробки кастомного нагадування
 bot.on("message", (msg) => {
@@ -81,18 +83,35 @@ bot.on("message", (msg) => {
 
 
 // Збереження задачі до бази даних
-function saveTask(chatId, chosenDateTime) {
+function saveTask(chatId, chosenDateTime, reminderTime) {
   db.run(
-    "INSERT INTO tasks (chat_id, task, date_time) VALUES (?, ?, ?)",
-    [chatId, userState[chatId].task, chosenDateTime.toISOString()],
+    "INSERT INTO tasks (chat_id, task, date_time, reminder_time) VALUES (?, ?, ?, ?)",
+    [chatId, userState[chatId].task, chosenDateTime.toISOString(), reminderTime.toISOString()],
     (err) => {
       if (err) {
-        console.error(`Помилка збереження задачі: ${err.message}`);
+        console.error(`Error saving task: ${err.message}`);
       } else {
-        console.log("Задачу успішно збережено.");
+        console.log("Task successfully saved.");
       }
     }
   );
+}
+
+// Завантаження всіх запланованих нагадувань з бази даних
+function loadScheduledReminders() {
+  db.all("SELECT chat_id, task, reminder_time FROM tasks WHERE reminder_time IS NOT NULL", [], (err, rows) => {
+    if (err) {
+      console.error(`Error loading scheduled reminders: ${err.message}`);
+      return;
+    }
+
+    rows.forEach((row) => {
+      const reminderTime = new Date(row.reminder_time);
+      if (reminderTime > new Date()) { // Переконайтесь, що час нагадування ще не минув
+        scheduleReminder(row.chat_id, reminderTime, row.task);
+      }
+    });
+  });
 }
 
 // Очищення стану користувача
