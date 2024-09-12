@@ -1,21 +1,26 @@
 const TelegramBot = require("node-telegram-bot-api");
 const sqlite3 = require("sqlite3").verbose();
 const schedule = require("node-schedule");
+const moment = require("moment-timezone");
+
 const token = process.env.TELEGRAM_TOKEN;
-const bot = new TelegramBot(token, { polling: true, request: { debug: true } });
-const userState = {}; // Зберігає стан для кожного користувача
+const bot = new TelegramBot(token, { polling: true });
+const userState = {}; // Stores user state
 
 const db = new sqlite3.Database("./tasks.db");
 
-// Ловимо помилки polling
+// Handling polling errors
 bot.on("polling_error", (error) => {
   console.error(`Polling error: ${error.code} - ${error.message}`);
 });
 
-// Створення таблиці, якщо вона не існує
+// Load scheduled reminders when bot starts
+loadScheduledReminders();
+
+// Create table if it doesn't exist
 db.serialize(() => {
   db.run(
-    "CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, task TEXT, date_time TEXT)",
+    "CREATE TABLE IF NOT EXISTS tasks (id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, task TEXT, date_time TEXT, reminder_time TEXT, timezone TEXT)",
     (err) => {
       if (err) {
         console.error(`Error creating table: ${err.message}`);
@@ -24,86 +29,120 @@ db.serialize(() => {
   );
 });
 
-// Закриття бази даних при завершенні програми
-process.on('SIGINT', () => {
+// Close database connection on exit
+process.on("SIGINT", () => {
   db.close((err) => {
     if (err) {
-      console.error('Помилка при закритті бази даних:', err.message);
+      console.error("Error closing database:", err.message);
     }
-    console.log('База даних успішно закрита.');
+    console.log("Database closed successfully.");
     process.exit(0);
   });
 });
 
-// Функція для відправки варіантів вибору часу
+// Send time options to user
 function sendTimeOptions(chatId) {
-  bot.sendMessage(chatId, "Виберіть час для задачі або введіть власний:", {
+  bot.sendMessage(chatId, "Choose a time for the task or enter your own:", {
     reply_markup: {
       inline_keyboard: [
         [{ text: "09:00", callback_data: "09:00" }],
         [{ text: "12:00", callback_data: "12:00" }],
         [{ text: "18:00", callback_data: "18:00" }],
-        [{ text: "Ввести власний час", callback_data: "custom_time" }],
+        [{ text: "Enter custom time", callback_data: "custom_time" }],
       ],
     },
   });
+  userState[chatId].step = "waitingForTime";
 }
 
-function scheduleReminder(chatId, reminderTime, task) {
-  console.log(`Scheduling reminder for ${reminderTime}`); // Додайте лог для перевірки
-  schedule.scheduleJob(reminderTime, () => {
+// Send reminder options to user
+function sendReminderOptions(chatId) {
+  bot.sendMessage(chatId, "When would you like to receive a reminder?", {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "1 hour before", callback_data: "one_hour" }],
+        [{ text: "1 day before", callback_data: "one_day" }],
+        [{ text: "Custom time", callback_data: "custom_reminder" }],
+      ],
+    },
+  });
+  userState[chatId].step = "waitingForReminder";
+}
+
+// Send date options to user
+function sendDateOptions(chatId) {
+  bot.sendMessage(chatId, "When is this task scheduled?", {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "Today", callback_data: "today" }],
+        [{ text: "Tomorrow", callback_data: "tomorrow" }],
+        [{ text: "Enter custom date", callback_data: "custom_date" }]
+      ]
+    }
+  });
+  userState[chatId].step = "waitingForDate";
+}
+
+// Schedule reminder with user's timezone
+function scheduleReminder(chatId, reminderTime, task, timezone) {
+  const reminderTimeInUserTz = moment.tz(reminderTime, timezone);
+  const reminderTimeUtc = reminderTimeInUserTz.utc().toDate();
+
+  const currentTime = new Date();
+  if (reminderTimeUtc <= currentTime) {
+    return; // Skip scheduling if reminder time is in the past
+  }
+
+  schedule.scheduleJob(reminderTimeUtc, () => {
     bot.sendMessage(chatId, `Reminder: ${task}`);
-    console.log(`Reminder sent for task: ${task}`); // Додайте лог для перевірки
   });
 }
 
-// Ваша функція обробки кастомного нагадування
-bot.on("message", (msg) => {
-  const chatId = msg.chat.id;
-  if (!userState[chatId]) return;
+// Save task to database (with timezone consideration)
+function saveTask(chatId, task, dateTime, reminderTime) {
+  const timezone = userState[chatId]?.timezone;
 
-  const userStep = userState[chatId].step;
-
-  if (userStep === "waitingForCustomReminder") {
-    const minutesBefore = parseInt(msg.text);
-    if (isNaN(minutesBefore) || minutesBefore <= 0) {
-      bot.sendMessage(chatId, "Invalid value. Enter a positive number of minutes.");
-      return;
-    }
-
-    const reminderTime = new Date(userState[chatId].chosenDateTime.getTime() - minutesBefore * 60 * 1000);
-    console.log(`Reminder time: ${reminderTime}`);
-    scheduleReminder(chatId, reminderTime, userState[chatId].task);
-    saveTask(chatId, userState[chatId].chosenDateTime);
+  if (!timezone) {
+    console.error(`No timezone set for user ${chatId}`);
+    return;
   }
-});
 
+  const dateTimeUtc = moment.tz(dateTime, timezone).utc().toISOString();
+  const reminderTimeUtc = reminderTime ? moment.tz(reminderTime, timezone).utc().toISOString() : null;
 
-
-// Збереження задачі до бази даних
-function saveTask(chatId, chosenDateTime) {
   db.run(
-    "INSERT INTO tasks (chat_id, task, date_time) VALUES (?, ?, ?)",
-    [chatId, userState[chatId].task, chosenDateTime.toISOString()],
+    "INSERT INTO tasks (chat_id, task, date_time, reminder_time, timezone) VALUES (?, ?, ?, ?, ?)",
+    [chatId, task, dateTimeUtc, reminderTimeUtc, timezone],
     (err) => {
       if (err) {
-        console.error(`Помилка збереження задачі: ${err.message}`);
+        console.error(`Error saving task: ${err.message}`);
       } else {
-        console.log("Задачу успішно збережено.");
+        console.log("Task successfully saved.");
       }
     }
   );
 }
 
-// Очищення стану користувача
-function clearUserState(chatId) {
-  if (userState[chatId]) {
-    delete userState[chatId];
-    console.log(`Стан для користувача ${chatId} очищено.`);
-  }
+// Load scheduled reminders from database
+function loadScheduledReminders() {
+  db.all("SELECT chat_id, task, reminder_time, timezone FROM tasks WHERE reminder_time IS NOT NULL", [], (err, rows) => {
+    if (err) {
+      console.error(`Error loading scheduled reminders: ${err.message}`);
+      return;
+    }
+
+    rows.forEach((row) => {
+      const reminderTime = new Date(row.reminder_time);
+      const timezone = row.timezone;
+
+      if (reminderTime > new Date()) {
+        scheduleReminder(row.chat_id, reminderTime, row.task, timezone);
+      }
+    });
+  });
 }
 
-// Функція для обробки часу нагадування
+// Handle reminder settings
 function handleReminder(chatId, data) {
   let reminderTime;
 
@@ -113,214 +152,166 @@ function handleReminder(chatId, data) {
     reminderTime = new Date(userState[chatId].chosenDateTime.getTime() - 24 * 60 * 60 * 1000);
   } else if (data === "custom_reminder") {
     userState[chatId].step = "waitingForCustomReminder";
-    bot.sendMessage(chatId, "За скільки хвилин до задачі ви хочете отримати нагадування?");
+    bot.sendMessage(chatId, "In how many minutes before the task would you like to receive a reminder?");
     return;
   }
 
-  scheduleReminder(chatId, reminderTime, userState[chatId].task);
-  saveTask(chatId, userState[chatId].chosenDateTime);
-  bot.sendMessage(chatId, "Задачу додано! Ви отримаєте нагадування в зазначений час.");
+  scheduleReminder(chatId, reminderTime, userState[chatId].task, userState[chatId].timezone);
+  saveTask(chatId, userState[chatId].task, userState[chatId].chosenDateTime, reminderTime);
+  bot.sendMessage(chatId, "Task added! You will receive a reminder at the specified time.");
   clearUserState(chatId);
-  
 }
 
-// Вітальне повідомлення
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(
-    msg.chat.id,
-    "Привіт! Я допоможу тобі планувати задачі. Напиши /help для перегляду доступних команд."
-  );
-});
+// Handle date selection
+function handleDateSelection(chatId, data) {
+  let chosenDate;
 
-// Обробка скасування дії
-bot.onText(/\/cancel/, (msg) => {
-  const chatId = msg.chat.id;
-  if (userState[chatId]) {
-    clearUserState(chatId);
-    bot.sendMessage(chatId, "Дію скасовано.");
-  } else {
-    bot.sendMessage(chatId, "Немає активної дії для скасування.");
-  }
-});
-
-// Команда для додавання задачі
-bot.onText(/\/add/, (msg) => {
-  const chatId = msg.chat.id;
-
-  if (userState[chatId] && userState[chatId].chosenDateTime) {
-    bot.sendMessage(chatId, "Спочатку завершіть попередню дію.");
+  if (data === "today") {
+    chosenDate = moment.tz(userState[chatId].timezone).format("YYYY-MM-DD");
+  } else if (data === "tomorrow") {
+    chosenDate = moment.tz(userState[chatId].timezone).add(1, 'days').format("YYYY-MM-DD");
+  } else if (data === "custom_date") {
+    bot.sendMessage(chatId, "Please enter the custom date in YYYY-MM-DD format.");
+    userState[chatId].step = "waitingForCustomDate";
     return;
   }
 
-  userState[chatId] = { step: "addingTask" };
-  bot.sendMessage(chatId, "Напиши назву задачі (або /cancel для скасування):");
-});
+  userState[chatId].chosenDate = chosenDate;
+  sendTimeOptions(chatId);
+}
 
-// Команда для перегляду задач
-bot.onText(/\/tasks/, (msg) => {
+// Handle time selection
+function handleTimeSelection(chatId, data) {
+  let chosenTime;
+
+  if (data === "custom_time") {
+    bot.sendMessage(chatId, "Please enter the custom time for your task in HH:MM format.");
+    userState[chatId].step = "waitingForCustomTime";
+    return;
+  } else {
+    chosenTime = data;
+  }
+
+  const chosenDateTime = `${userState[chatId].chosenDate} ${chosenTime}`;
+  userState[chatId].chosenDateTime = moment.tz(chosenDateTime, "YYYY-MM-DD HH:mm", userState[chatId].timezone).toDate();
+
+  sendReminderOptions(chatId);
+}
+
+// Clear user state
+function clearUserState(chatId) {
+  if (userState[chatId]) {
+    delete userState[chatId];
+  }
+}
+
+// Handle the /start command
+bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
 
-  db.all("SELECT id, task, date_time FROM tasks WHERE chat_id = ?", [chatId], (err, rows) => {
+  db.get("SELECT timezone FROM tasks WHERE chat_id = ?", [chatId], (err, row) => {
     if (err) {
-      bot.sendMessage(chatId, "Сталася помилка при отриманні задач.");
+      bot.sendMessage(chatId, "An error occurred. Please try again later.");
       return;
     }
 
-    if (rows.length === 0) {
-      bot.sendMessage(chatId, "У вас немає задач.");
+    if (!row || !row.timezone) {
+      userState[chatId] = { step: "waitingForTimezone" };
+      bot.sendMessage(chatId, "Welcome! Please provide your timezone in the format 'Continent/City' (e.g., Europe/Kiev).");
     } else {
-      let taskList = "Ваші задачі:\n";
-      rows.forEach((row) => {
-        const date = new Date(row.date_time);
-        const formattedDate = date.toLocaleDateString('uk-UA', {
-          weekday: 'long',
-          year: 'numeric',
-          month: 'long',
-          day: 'numeric',
-        });
-        const formattedTime = date.toLocaleTimeString('uk-UA', {
-          hour: '2-digit',
-          minute: '2-digit',
-        });
-
-        taskList += `ID: ${row.id}\nЗадача: ${row.task}\nДата: ${formattedDate}\nЧас: ${formattedTime}\n\n`;
-      });
-      bot.sendMessage(chatId, taskList);
+      userState[chatId] = { timezone: row.timezone };
+      bot.sendMessage(chatId, `Welcome back! Your timezone is set to ${row.timezone}.`);
     }
   });
 });
 
+// Handle the /set_timezone command
+bot.onText(/\/set_timezone/, (msg) => {
+  const chatId = msg.chat.id;
+  userState[chatId] = { step: "waitingForTimezone" };
+  bot.sendMessage(chatId, "Please provide your timezone in the format 'Continent/City' (e.g., Europe/Kiev).");
+});
 
-// Один обробник для всіх повідомлень
+// Handle user messages for setting timezone or task details
 bot.on("message", (msg) => {
   const chatId = msg.chat.id;
 
-  if (!userState[chatId]) return;
+  if (userState[chatId] && userState[chatId].step === "waitingForTimezone") {
+    const timezone = msg.text.trim();
+if (moment.tz.zone(timezone)) {
+  // Таймзона вірна
+  db.run("UPDATE tasks SET timezone = ? WHERE chat_id = ?", [timezone, chatId], (err) => {
+    if (err) {
+      bot.sendMessage(chatId, "An error occurred while saving your timezone.");
+      return;
+    }
 
-  const userStep = userState[chatId].step;
-  console.log(`Крок користувача: ${userStep}`);
+    userState[chatId].timezone = timezone;
+    bot.sendMessage(chatId, `Timezone set to ${timezone}. You can now add tasks.`);
+  });
+} else {
+  // Неправильний формат таймзони
+  bot.sendMessage(chatId, "Invalid timezone format. Please try again.");
+  console.log(`Invalid timezone: ${timezone}`);
+}
 
-  if (userStep === "addingTask") {
-    const task = msg.text;
-
-    if (task === "/cancel") {
+  } else if (userState[chatId] && userState[chatId].step === "waitingForTaskDescription") {
+    userState[chatId].task = msg.text.trim();
+    sendDateOptions(chatId);
+  } else if (userState[chatId] && userState[chatId].step === "waitingForCustomDate") {
+    const date = msg.text.trim();
+    if (moment(date, "YYYY-MM-DD", true).isValid()) {
+      userState[chatId].chosenDate = date;
+      sendTimeOptions(chatId);
+    } else {
+      bot.sendMessage(chatId, "Invalid date format. Please enter the date in YYYY-MM-DD format.");
+    }
+  } else if (userState[chatId] && userState[chatId].step === "waitingForCustomTime") {
+    const time = msg.text.trim();
+    if (moment(time, "HH:mm", true).isValid()) {
+      const chosenDateTime = `${userState[chatId].chosenDate} ${time}`;
+      userState[chatId].chosenDateTime = moment.tz(chosenDateTime, "YYYY-MM-DD HH:mm", userState[chatId].timezone).toDate();
+      sendReminderOptions(chatId);
+    } else {
+      bot.sendMessage(chatId, "Invalid time format. Please enter the time in HH:MM format.");
+    }
+  } else if (userState[chatId] && userState[chatId].step === "waitingForCustomReminder") {
+    const minutes = parseInt(msg.text.trim(), 10);
+    if (!isNaN(minutes) && minutes > 0) {
+      const reminderTime = new Date(userState[chatId].chosenDateTime.getTime() - minutes * 60 * 1000);
+      scheduleReminder(chatId, reminderTime, userState[chatId].task, userState[chatId].timezone);
+      saveTask(chatId, userState[chatId].task, userState[chatId].chosenDateTime, reminderTime);
+      bot.sendMessage(chatId, `Task added! You will receive a reminder ${minutes} minutes before the task.`);
       clearUserState(chatId);
-      bot.sendMessage(chatId, "Додавання задачі скасовано.");
-      return;
+    } else {
+      bot.sendMessage(chatId, "Please enter a valid number of minutes.");
     }
-
-    userState[chatId].task = task;
-    userState[chatId].step = "waitingForDate";
-    bot.sendMessage(chatId, "Виберіть дату для задачі:", {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "Сьогодні", callback_data: "today" }],
-          [{ text: "Завтра", callback_data: "tomorrow" }],
-          [{ text: "Інша дата", callback_data: "other_date" }],
-        ],
-      },
-    });
-  } else if (userStep === "waitingForManualDate") {
-    const manualDate = new Date(msg.text);
-    const now = new Date();
-
-    if (manualDate.toString() === 'Invalid Date' || manualDate < now) {
-      bot.sendMessage(chatId, "Неправильний формат або дата в минулому. Введіть дату у форматі YYYY-MM-DD.");
-      return;
-    }
-
-    userState[chatId].chosenDate = manualDate;
-    userState[chatId].step = "waitingForTime";
-    sendTimeOptions(chatId);
-  } else if (userStep === "waitingForCustomTime") {
-    const customTime = msg.text;
-    const isValidTime = /^\d{2}:\d{2}$/.test(customTime);
-
-    const chosenDateTime = new Date(
-      `${userState[chatId].chosenDate.toISOString().split("T")[0]}T${customTime}:00`
-    );
-    const now = new Date();
-
-    console.log(`Дата і час задачі: ${chosenDateTime}`);
-
-    if (!isValidTime || chosenDateTime < now) {
-      bot.sendMessage(chatId, "Неправильний формат або час в минулому. Введіть час у форматі HH:MM.");
-      return;
-    }
-
-    userState[chatId].chosenTime = customTime;
-    userState[chatId].chosenDateTime = chosenDateTime;
-    userState[chatId].step = "waitingForReminder";
-
-    bot.sendMessage(chatId, "Коли ви хочете отримати нагадування?", {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "За годину", callback_data: "one_hour" }],
-          [{ text: "За день", callback_data: "one_day" }],
-          [{ text: "Свій час", callback_data: "custom_reminder" }],
-        ],
-      },
-    });
-  } else if (userStep === "waitingForCustomReminder") {
-    const minutesBefore = parseInt(msg.text);
-    if (isNaN(minutesBefore) || minutesBefore <= 0) {
-      bot.sendMessage(chatId, "Будь ласка, введіть правильне число хвилин.");
-      return;
-    }
-
-    const reminderTime = new Date(userState[chatId].chosenDateTime.getTime() - minutesBefore * 60 * 1000);
-    scheduleReminder(chatId, reminderTime, userState[chatId].task);
-    saveTask(chatId, userState[chatId].chosenDateTime);
-    bot.sendMessage(chatId, "Задачу додано! Ви отримаєте нагадування в зазначений час.");
-    clearUserState(chatId);
   }
 });
 
-// Обробка callback даних
-bot.on("callback_query", (callbackQuery) => {
-  const msg = callbackQuery.message;
+// Handle the /add command (now without task description)
+bot.onText(/\/add/, (msg) => {
   const chatId = msg.chat.id;
+
+  if (!userState[chatId] || !userState[chatId].timezone) {
+    bot.sendMessage(chatId, "Please set your timezone using /set_timezone before adding tasks.");
+    return;
+  }
+
+  userState[chatId] = { step: "waitingForTaskDescription", timezone: userState[chatId].timezone };
+  bot.sendMessage(chatId, "Please enter the description of the task.");
+});
+
+// Handle callback queries (date, time, reminder selection)
+bot.on("callback_query", (callbackQuery) => {
+  const chatId = callbackQuery.message.chat.id;
   const data = callbackQuery.data;
 
-  if (userState[chatId] && userState[chatId].step === "waitingForDate") {
-    const now = new Date();
-    if (data === "today") {
-      userState[chatId].chosenDate = now;
-      userState[chatId].step = "waitingForTime";
-      sendTimeOptions(chatId);
-    } else if (data === "tomorrow") {
-      const tomorrow = new Date(now);
-      tomorrow.setDate(now.getDate() + 1);
-      userState[chatId].chosenDate = tomorrow;
-      userState[chatId].step = "waitingForTime";
-      sendTimeOptions(chatId);
-    } else if (data === "other_date") {
-      userState[chatId].step = "waitingForManualDate";
-      bot.sendMessage(chatId, "Введіть дату у форматі YYYY-MM-DD.");
-    }
-  } else if (userState[chatId] && userState[chatId].step === "waitingForTime") {
-    if (data === "custom_time") {
-      userState[chatId].step = "waitingForCustomTime";
-      bot.sendMessage(chatId, "Введіть час у форматі HH:MM.");
-    } else {
-      const chosenDateTime = new Date(
-        `${userState[chatId].chosenDate.toISOString().split("T")[0]}T${data}:00`
-      );
-      userState[chatId].chosenTime = data;
-      userState[chatId].chosenDateTime = chosenDateTime;
-      userState[chatId].step = "waitingForReminder";
-
-      bot.sendMessage(chatId, "Коли ви хочете отримати нагадування?", {
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: "За годину", callback_data: "one_hour" }],
-            [{ text: "За день", callback_data: "one_day" }],
-            [{ text: "Свій час", callback_data: "custom_reminder" }],
-          ],
-        },
-      });
-    }
-  } else if (userState[chatId] && userState[chatId].step === "waitingForReminder") {
+  if (userState[chatId].step === "waitingForDate") {
+    handleDateSelection(chatId, data);
+  } else if (userState[chatId].step === "waitingForTime") {
+    handleTimeSelection(chatId, data);
+  } else if (userState[chatId].step === "waitingForReminder") {
     handleReminder(chatId, data);
   }
 });
